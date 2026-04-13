@@ -21,7 +21,7 @@ from tkstore.tagger_index import MemoryRetriever
 
 _STATE: Dict[str, Any] = {
     "provider": "auto",
-    "model": "azure/gpt-5",
+    "model": "azure/gpt-5.4",
     "draft_sql_model": None,
 }
 
@@ -100,7 +100,7 @@ class TKStore:
     ) -> List[Dict[str, Any]]:
         if not self.store:
             raise ValueError("TKStore has no bound store path.")
-        model = llm_model or _STATE.get("model") or "azure/gpt-5"
+        model = llm_model or _STATE.get("model") or "azure/gpt-5.4"
         return MemoryRetriever(self.store).retrieve(
             sql_text=sql_text,
             generic_only=generic_only,
@@ -272,7 +272,7 @@ def init(
             os.environ["AZURE_OPENAI_ENDPOINT"] = base_url
         if api_version:
             os.environ["AZURE_API_VERSION"] = api_version
-        default_model = "azure/gpt-5"
+        default_model = "azure/gpt-5.4"
 
     _STATE["provider"] = selected
     _STATE["model"] = model or default_model
@@ -310,7 +310,7 @@ def generate(
     if bool(example_json) == bool(examples_dir):
         raise ValueError("Provide exactly one of example_json or examples_dir")
 
-    effective_model = model or _STATE.get("model") or "azure/gpt-5"
+    effective_model = model or _STATE.get("model") or "azure/gpt-5.4"
     effective_draft = draft_sql_model if draft_sql_model is not None else _STATE.get("draft_sql_model")
     target_store = store
     tk_store = TKStore(target_store) if target_store else None
@@ -395,10 +395,14 @@ class SQLAgent:
     a compact interface for generating an executable draft SQL.
     """
 
-    def __init__(self, model: Optional[str] = None, max_turns: int = 25, verbose: bool = False):
+    def __init__(self, model: Optional[str] = None, max_turns: int = 25,
+                 verbose: bool = False, trace_dir: Optional[str] = "traces",
+                 vanilla: bool = False):
         self.model = model
         self.max_turns = max_turns
         self.verbose = verbose
+        self.trace_dir = trace_dir
+        self.vanilla = vanilla
 
     def translate(
         self,
@@ -417,17 +421,32 @@ class SQLAgent:
         if executor is None:
             raise ValueError("executor is required")
 
-        from src.agents.sql_agent_runner import Instance, run_agent  # lazy import
+        from src.agents.sql_agent_runner import Instance, run_agent, generate_processed_trace  # lazy import
+        from src.utils.agent_utils import load_external_knowledge  # lazy import
+        import json
+        import time
 
-        model = self.model or _STATE.get("model") or "azure/gpt-5"
+        model = self.model or _STATE.get("model") or "azure/gpt-5.4"
         engine = _infer_engine_from_executor(executor)
         db_path_or_cred = _infer_executor_target(executor)
+
+        # Load external knowledge file content if a filename was provided
+        loaded_knowledge = load_external_knowledge(instance_id, external_knowledge)
+        if loaded_knowledge:
+            external_knowledge = loaded_knowledge
+
         inst = Instance(
             instance_id=instance_id,
             db=db_name,
             question=question,
             external_knowledge=external_knowledge,
         )
+
+        # Compute trace base path so sub-agents can save traces alongside the main agent
+        trace_base_path = None
+        if self.trace_dir:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            trace_base_path = str(Path(self.trace_dir) / f"{instance_id}_{ts}")
 
         final_sql, headers, rows, messages, exec_used = run_agent(
             inst=inst,
@@ -442,12 +461,45 @@ class SQLAgent:
             max_turns=self.max_turns,
             train_context_file=None,
             verbose=self.verbose,
+            trace_dir=trace_base_path,
+            vanilla=self.vanilla,
         )
         try:
             if hasattr(exec_used, "close"):
                 exec_used.close()
         except Exception:
             pass
+
+        # Save traces (sub-agent traces already saved by run_agent via trace_dir)
+        trace_path = None
+        if trace_base_path:
+            trace_base = Path(trace_base_path)
+            trace_base.mkdir(parents=True, exist_ok=True)
+
+            # messages.json — full LLM conversation
+            (trace_base / "messages.json").write_text(
+                json.dumps(messages, indent=2), encoding="utf-8"
+            )
+            # processed_trace.txt — human-readable trace
+            (trace_base / "processed_trace.txt").write_text(
+                generate_processed_trace(messages), encoding="utf-8"
+            )
+            # execution_query.sql — final SQL
+            (trace_base / "execution_query.sql").write_text(
+                final_sql or "", encoding="utf-8"
+            )
+            # execution_result.csv — query results
+            if headers and rows:
+                import csv as _csv
+                with open(trace_base / "execution_result.csv", "w", newline="", encoding="utf-8") as f:
+                    writer = _csv.writer(f)
+                    writer.writerow(headers)
+                    for r in rows:
+                        writer.writerow(list(r))
+
+            trace_path = str(trace_base)
+            if self.verbose:
+                print(f"\n📁 Traces saved to: {trace_path}")
 
         return {
             "sql": final_sql,
@@ -457,6 +509,7 @@ class SQLAgent:
             "messages": messages,
             "model": model,
             "engine": engine,
+            "trace_path": trace_path,
         }
 
     def draft(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
@@ -527,7 +580,7 @@ def sql(
     except Exception as e:
         raise RuntimeError("litellm is required for tkboost.sql(). Install dependencies first.") from e
 
-    effective_model = model or _STATE.get("model") or "azure/gpt-5"
+    effective_model = model or _STATE.get("model") or "azure/gpt-5.4"
     engine = _infer_engine_from_executor(executor)
 
     draft_sql = draft
