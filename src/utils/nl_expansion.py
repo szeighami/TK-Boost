@@ -164,16 +164,25 @@ def run_sub_agent(
     trace_dir: Optional[str] = None,
     main_turn: Optional[int] = None,
     nl_call_index: int = 0,
+    original_query: Optional[str] = None,
+    external_knowledge: Optional[str] = None,
 ) -> str:
     """Run a full ReAct agent to translate a natural language description into SQL."""
     from src.agents.sql_agent_runner import Instance, run_agent, generate_processed_trace
     from src.agents.prompts import SUB_AGENT_PROMPT
     import json
 
-    question = (
-        f"{description}\n"
-        f"The output must have exactly these columns: {output_schema}"
-    )
+    parts = []
+    parts.append(f"[YOUR TASK]\n{description}")
+    parts.append(f"The output must have exactly these columns: {output_schema}")
+    if original_query or external_knowledge:
+        context = "[ADDITIONAL CONTEXT]\nFor additional context, this task is part of a broader query that we're also providing below. Use it to inform your understanding of the task, but focus on producing the output described above.\n"
+        if original_query:
+            context += f"\nUser query: {original_query}"
+        if external_knowledge:
+            context += f"\n\nExternal knowledge: {external_knowledge}"
+        parts.append(context)
+    question = "\n\n".join(parts)
 
     engine = "sqlite"  # NL() UDF currently supports SQLite
     db_path_or_cred = getattr(executor, 'db_path', None)
@@ -196,7 +205,7 @@ def run_sub_agent(
         model=model,
         predicted_cte_hint=None,
         predicted_schema_hint=None,
-        max_turns=10,
+        max_turns=30,
         verbose=verbose,
         system_prompt=SUB_AGENT_PROMPT,
     )
@@ -241,6 +250,8 @@ def expand_nl_calls(
     verbose: bool = False,
     trace_dir: Optional[str] = None,
     main_turn: Optional[int] = None,
+    original_query: Optional[str] = None,
+    external_knowledge: Optional[str] = None,
 ) -> str:
     """Expand all NL() calls in a SQL string into real subqueries.
 
@@ -251,31 +262,49 @@ def expand_nl_calls(
     if not calls:
         return sql
 
+    if len(calls) > 5:
+        if verbose:
+            print(f"\n⚠️  Too many NL() calls ({len(calls)}), max 5 allowed. Skipping expansion.")
+        return sql
+
+    # Cache: deduplicate identical NL() calls (same description + schema)
+    cache = {}  # (description, output_schema) -> wrapper string
+
     # Process in reverse order to preserve string positions
     expanded = sql
     for call_idx, call in enumerate(reversed(calls)):
         try:
-            generated_sql = run_sub_agent(
-                description=call.description,
-                output_schema=call.output_schema,
-                executor=executor,
-                model=model,
-                verbose=verbose,
-                trace_dir=trace_dir,
-                main_turn=main_turn,
-                nl_call_index=len(calls) - 1 - call_idx,
-            )
-
-            # Parse output_schema to get column names for the wrapper
-            col_names = _parse_schema_columns(call.output_schema)
-            if col_names:
-                wrapper = f"(SELECT {', '.join(col_names)} FROM ({generated_sql}) AS _nl_inner)"
+            cache_key = (call.description.strip(), call.output_schema.strip())
+            if cache_key in cache:
+                wrapper = cache[cache_key]
+                if verbose:
+                    print(f"\n[NL() CACHE HIT]: reusing result for NL(\"{call.description[:80]}...\")")
             else:
-                wrapper = f"({generated_sql})"
+                generated_sql = run_sub_agent(
+                    description=call.description,
+                    output_schema=call.output_schema,
+                    executor=executor,
+                    model=model,
+                    verbose=verbose,
+                    trace_dir=trace_dir,
+                    main_turn=main_turn,
+                    nl_call_index=len(calls) - 1 - call_idx,
+                    original_query=original_query,
+                    external_knowledge=external_knowledge,
+                )
 
-            if verbose:
-                print(f"\n[NL() EXPANSION]: NL(\"{call.description}\", \"{call.output_schema}\")")
-                print(f"  -> {generated_sql[:200]}{'...' if len(generated_sql) > 200 else ''}")
+                # Parse output_schema to get column names for the wrapper
+                col_names = _parse_schema_columns(call.output_schema)
+                if col_names:
+                    wrapper = f"(SELECT {', '.join(col_names)} FROM ({generated_sql}) AS _nl_inner)"
+                else:
+                    wrapper = f"({generated_sql})"
+
+                cache[cache_key] = wrapper
+
+                if verbose:
+                    print(f"\n[NL() EXPANSION]: NL(\"{call.description}\", \"{call.output_schema}\")")
+                    print(f"  -> {generated_sql[:200]}{'...' if len(generated_sql) > 200 else ''}")
 
             expanded = expanded[:call.start] + wrapper + expanded[call.end:]
 

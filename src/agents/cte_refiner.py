@@ -33,6 +33,7 @@ def _is_openai_provider() -> bool:
 
 def llm(model: str, messages: list, **kwargs):
     mapped = AZURE_TO_OPENAI_MODEL.get(model, model) if _is_openai_provider() else model
+    kwargs.setdefault("reasoning_effort", "high")
     return litellm.completion(model=mapped, messages=messages, **kwargs)
 
 

@@ -56,6 +56,7 @@ def _is_openai_provider() -> bool:
 
 def llm_completion(model: str, messages: list, **params):
     mapped_model = AZURE_TO_OPENAI_MODEL.get(model, model) if _is_openai_provider() else model
+    params.setdefault("reasoning_effort", "high")
     return litellm.completion(model=mapped_model, messages=messages, **params)
 
 
@@ -242,16 +243,19 @@ def load_ground_truth(instance_id: str) -> Tuple[Optional[str], Optional[List[Tu
 
 
 # ----------------- Agent Core -----------------
-def get_system_prompt(instance_id: str, train_context_file: str = None) -> str:
+def get_system_prompt(instance_id: str, train_context_file: str = None, vanilla: bool = False) -> str:
     """Return appropriate system prompt based on instance type.
 
+    If vanilla=True, use the vanilla (non-NL-UDF) prompt.
     If train_context_file is provided (TEMP EXPERIMENT), prepend its contents
     to the system prompt."""
     if instance_id.lower().startswith('sf'):
         base_prompt = SNOWFLAKE_PROMPT
+    elif vanilla:
+        base_prompt = SUB_AGENT_PROMPT
     else:
         base_prompt = MAIN_AGENT_PROMPT
-    
+
     # TEMP EXPERIMENT: Prepend train context if provided
     if train_context_file:
         try:
@@ -259,7 +263,7 @@ def get_system_prompt(instance_id: str, train_context_file: str = None) -> str:
             return train_context + "\n\n" + base_prompt
         except Exception as e:
             print(f"⚠️  Failed to load train context file: {e}")
-    
+
     return base_prompt
 
 
@@ -308,10 +312,11 @@ def run_agent(inst: Instance,
               train_context_file: str = None,  # TEMP EXPERIMENT
               verbose: bool = True,
               system_prompt: Optional[str] = None,
-              trace_dir: Optional[str] = None) -> Tuple[str, Optional[List[str]], List[Tuple], List[dict], Executor]:
+              trace_dir: Optional[str] = None,
+              vanilla: bool = False) -> Tuple[str, Optional[List[str]], List[Tuple], List[dict], Executor]:
     executor = make_executor(engine, db_path_or_cred)
     if system_prompt is None:
-        system_prompt = get_system_prompt(inst.instance_id, train_context_file)
+        system_prompt = get_system_prompt(inst.instance_id, train_context_file, vanilla=vanilla)
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": build_user_message(inst, predicted_cte_hint, predicted_schema_hint, schema_context, external_knowledge, expected_output_format)},
@@ -360,31 +365,55 @@ def run_agent(inst: Instance,
             print(f"\n[ASSISTANT RESPONSE]:")
             print(content[:500] + "..." if len(content) > 500 else content)
 
-        sol = detect_solution(content)
-        if sol:
-            final_sql = sol
+        # Find the first block in order of appearance and only process that one
+        import re as _re
+        block_matches = list(_re.finditer(r"<(think|sql|solution)>([\s\S]*?)</\1>", content, flags=_re.IGNORECASE))
+        multi_block_penalty = len(block_matches) > 1
+
+        if not block_matches:
+            if verbose:
+                print(f"\n⚠️  No block detected, prompting agent...")
+            messages.append({"role": "user", "content": "Send one <sql> now."})
+            _flush_messages()
+            continue
+
+        first_block_type = block_matches[0].group(1).lower()
+        first_block_content = block_matches[0].group(2).strip()
+
+        if multi_block_penalty:
+            if verbose:
+                types = [m.group(1).lower() for m in block_matches]
+                print(f"\n⚠️  Multiple blocks detected ({types}), only processing first ({first_block_type}).")
+
+        if first_block_type == "think":
+            # Think block — no SQL to execute, just tell agent to proceed
+            msg = "Proceed."
+            if multi_block_penalty:
+                msg = "Proceed. WARNING: You output multiple blocks in a single turn. Only the first block was processed, the rest were discarded. Output exactly ONE block per turn."
+            messages.append({"role": "user", "content": msg})
+            _flush_messages()
+            continue
+
+        if first_block_type == "solution":
+            final_sql = first_block_content
             if verbose:
                 print(f"\n✅ SOLUTION DETECTED!")
                 print(f"[FINAL SQL]:\n{final_sql[:300]}..." if len(final_sql) > 300 else final_sql)
             break
 
-        sql_blocks = detect_sql_blocks(content)
-        if not sql_blocks:
-            if verbose:
-                print(f"\n⚠️  No SQL block detected, prompting agent...")
-            messages.append({"role": "user", "content": "Send one <sql> now."})
-            _flush_messages()
-            continue
+        # first_block_type == "sql"
+        sql_text = first_block_content
 
-        sql_text = sql_blocks[0].strip()
-
-        # Expand any NL() calls into real subqueries before execution
-        try:
-            sql_text = expand_nl_calls(sql_text, executor, model, verbose=verbose,
-                                       trace_dir=trace_dir, main_turn=turn)
-        except Exception as e:
-            if verbose:
-                print(f"\n⚠️  NL() expansion error: {e}")
+        # Expand any NL() calls into real subqueries before execution (skip in vanilla mode)
+        if not vanilla:
+            try:
+                sql_text = expand_nl_calls(sql_text, executor, model, verbose=verbose,
+                                           trace_dir=trace_dir, main_turn=turn,
+                                           original_query=inst.question,
+                                           external_knowledge=external_knowledge)
+            except Exception as e:
+                if verbose:
+                    print(f"\n⚠️  NL() expansion error: {e}")
 
         if verbose:
             print(f"\n[EXECUTING SQL]:")
@@ -399,26 +428,104 @@ def run_agent(inst: Instance,
                 print(preview)
                 if len(table_text.split("\n")) > 10:
                     print("... (truncated)")
-            messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + table_text})
+            result_msg = "SQL_RESULT_TABLE:\n" + table_text
+            if multi_block_penalty:
+                result_msg += "\n\nWARNING: You output multiple blocks in a single turn. Only the first <sql> block was processed, the rest were discarded. Output exactly ONE block per turn."
+            messages.append({"role": "user", "content": result_msg})
             _flush_messages()
         except Exception as e:
             if verbose:
                 print(f"\n❌ [SQL ERROR]: {str(e)}")
-            messages.append({"role": "user", "content": f"SQL_ERROR: {str(e)}"})
+            error_msg = f"SQL_ERROR: {str(e)}"
+            if multi_block_penalty:
+                error_msg += "\n\nWARNING: You output multiple blocks in a single turn. Only the first <sql> block was processed, the rest were discarded. Output exactly ONE block per turn."
+            messages.append({"role": "user", "content": error_msg})
             _flush_messages()
             continue
 
     if not final_sql:
         final_sql = sql_text
 
-    # Expand any NL() calls in the final solution before execution
-    if final_sql:
+    # Expand any NL() calls in the final solution before execution (skip in vanilla mode)
+    if final_sql and not vanilla:
         try:
             final_sql = expand_nl_calls(final_sql, executor, model, verbose=verbose,
-                                        trace_dir=trace_dir, main_turn=None)
+                                        trace_dir=trace_dir, main_turn=None,
+                                        original_query=inst.question,
+                                        external_knowledge=external_knowledge)
         except Exception as e:
             if verbose:
                 print(f"⚠️  NL() expansion error in final SQL: {e}")
+
+    # Validation turn: execute expanded SQL, feed back to agent, get a pure-SQL final solution (skip in vanilla mode)
+    if final_sql and not vanilla:
+        expanded_result_text = ""
+        try:
+            exp_headers, exp_rows = executor.execute(final_sql)
+            expanded_result_text = format_table(exp_headers, exp_rows)
+            if verbose:
+                print(f"\n[EXPANDED SQL EXECUTED] ({len(exp_rows)} rows)")
+        except Exception as e:
+            expanded_result_text = f"SQL_ERROR: {str(e)}"
+            if verbose:
+                print(f"\n[EXPANDED SQL FAILED]: {e}")
+
+        validation_prompt = (
+            "Below is the expanded SQL (NL() calls resolved) and its execution result.\n\n"
+            "[GENERATED SQL]\n" + final_sql + "\n\n"
+            "[OBTAINED ANSWER]\n" + expanded_result_text + "\n\n"
+            "Validate the SQL and make any required changes to ensure correctness. "
+            "You are allowed to output additional <sql> during validation if needed. "
+            "Finally, produce another <solution> block containing ONLY the final SQL "
+            "(no NL() calls, no other text)."
+        )
+        messages.append({"role": "user", "content": validation_prompt})
+        _flush_messages()
+
+        # Run validation turns to let the agent validate and produce a pure-SQL solution
+        validated_sql = None
+        for val_turn in range(1, 11):
+            if verbose:
+                print(f"\n[VALIDATION TURN {val_turn}/10]")
+            try:
+                resp = llm_completion(model=model, messages=messages)
+                msg_obj = resp["choices"][0]["message"]
+                content = (msg_obj.get("content") or "").strip()
+                reasoning_content = (msg_obj.get("reasoning_content") or "").strip()
+                if not content:
+                    content = reasoning_content
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️  Validation LLM call failed: {e}")
+                break
+
+            messages.append({"role": "assistant", "content": content})
+            _flush_messages()
+
+            sol = detect_solution(content)
+            if sol:
+                validated_sql = sol.strip()
+                if verbose:
+                    print(f"[VALIDATED SOLUTION DETECTED]")
+                break
+
+            sql_blocks = detect_sql_blocks(content)
+            if sql_blocks:
+                probe_sql = sql_blocks[0].strip()
+                try:
+                    pr_headers, pr_rows = executor.execute(probe_sql)
+                    pr_text = format_table(pr_headers, pr_rows)
+                    preview = "\n".join(pr_text.split("\n")[:10])
+                    messages.append({"role": "user", "content": "SQL_RESULT_TABLE:\n" + pr_text})
+                except Exception as e:
+                    messages.append({"role": "user", "content": f"SQL_ERROR: {str(e)}"})
+                _flush_messages()
+            else:
+                messages.append({"role": "user", "content": "Produce the final <solution> block now with pure SQL (no NL() calls)."})
+                _flush_messages()
+
+        if validated_sql:
+            final_sql = validated_sql
 
     # Execute final SQL for output
     headers, rows = (None, [])

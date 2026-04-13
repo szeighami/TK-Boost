@@ -80,14 +80,20 @@ def load_external_knowledge(instance_id: str, external_knowledge_file: Optional[
     if not ext_file:
         return None
     
-    # External knowledge files are in data/spider2/{instance_id}/{filename}
-    ext_path = Path("data/spider2") / instance_id / ext_file
-    if ext_path.exists():
-        try:
-            return ext_path.read_text(encoding="utf-8")
-        except Exception as e:
-            print(f"⚠️  Warning: Could not read external knowledge file {ext_path}: {e}")
-            return None
+    # Search paths for external knowledge files:
+    # 1. data/spider2/{instance_id}/{filename}  (per-instance)
+    # 2. data/spider2/documents/{filename}       (shared documents)
+    search_paths = [
+        Path("data/spider2") / instance_id / ext_file,
+        Path("data/spider2/documents") / ext_file,
+    ]
+    for ext_path in search_paths:
+        if ext_path.exists():
+            try:
+                return ext_path.read_text(encoding="utf-8")
+            except Exception as e:
+                print(f"⚠️  Warning: Could not read external knowledge file {ext_path}: {e}")
+                return None
     return None
 
 

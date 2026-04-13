@@ -336,16 +336,7 @@ def evaluate_spider2sql(args):
                 pred_ids.append(inst_id)
                 pred_paths[inst_id] = chosen_exec
                 instance_dir_paths[inst_id] = chosen_dir
-                # delete older ones
-                older = [d for (_, d, _) in items_sorted if d != chosen_dir]
-                if older:
-                    print(f"🧹 {inst_id}: keeping latest '{os.path.basename(chosen_dir)}', deleting {len(older)} older run(s)")
-                    for od in older:
-                        try:
-                            _shutil.rmtree(od)
-                            print(f"   deleted: {od}")
-                        except Exception as e:
-                            print(f"   ⚠️ failed to delete {od}: {e}")
+                # Keep older runs for comparison (do not delete)
             # import pdb; pdb.set_trace()
             if not pred_ids:
                 # Fallback: CSVs placed directly under result_dir
